@@ -125,7 +125,7 @@ def get_bluesky_auth():
         sys.exit(1)
 
 def post_to_bluesky(content):
-    """Post content to Bluesky."""
+    """Post content to Bluesky with rich text formatting for URLs."""
     try:
         access_jwt = get_bluesky_auth()
         
@@ -134,12 +134,49 @@ def post_to_bluesky(content):
             'Content-Type': 'application/json'
         }
         
+        # Parse content to extract URLs for rich text formatting
+        lines = content.split('\n')
+        text = content
+        facets = []
+        
+        # Extract URLs for rich text formatting
+        import re
+        url_pattern = re.compile(r'https?://\S+')
+        
+        # Find all URLs in the content
+        for match in url_pattern.finditer(content):
+            url = match.group(0)
+            start_idx = match.start()
+            end_idx = match.end()
+            
+            # Calculate byte positions for rich text
+            byteStart = len(content[:start_idx].encode('utf-8'))
+            byteEnd = len(content[:end_idx].encode('utf-8'))
+            
+            # Create facet for URL
+            facets.append({
+                "index": {
+                    "byteStart": byteStart,
+                    "byteEnd": byteEnd
+                },
+                "features": [
+                    {
+                        "$type": "app.bsky.richtext.facet#link",
+                        "uri": url
+                    }
+                ]
+            })
+        
         post_data = {
             "$type": "app.bsky.feed.post",
             "text": content,
             "createdAt": datetime.now(timezone.utc).isoformat(),
             "langs": ["en"]
         }
+        
+        # Add facets if we found any URLs
+        if facets:
+            post_data["facets"] = facets
         
         resp = requests.post(
             'https://bsky.social/xrpc/com.atproto.repo.createRecord', 
