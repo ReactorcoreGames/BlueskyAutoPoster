@@ -4,7 +4,7 @@ import os
 import sys
 import base64
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 CSV_FILE = 'posts.csv'
 STATE_FILE = 'state.json'
@@ -72,7 +72,7 @@ headers = {
 post_data = {
     "$type": "app.bsky.feed.post",
     "text": content,
-    "createdAt": datetime.utcnow().isoformat() + 'Z'
+	"createdAt": datetime.now(timezone.utc).isoformat()
 }
 resp = session.post('https://bsky.social/xrpc/com.atproto.repo.createRecord', headers=headers, json={
     "collection": "app.bsky.feed.post",
