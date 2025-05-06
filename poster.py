@@ -2,105 +2,202 @@ import csv
 import json
 import os
 import sys
-import base64
 import requests
 from datetime import datetime, timezone
 
+# Constants
 CSV_FILE = 'posts.csv'
 STATE_FILE = 'state.json'
-
 BLUESKY_HANDLE = os.environ.get('BLUESKY_HANDLE')
 BLUESKY_APP_PASSWORD = os.environ.get('BLUESKY_APP_PASSWORD')
-REPO_ACTOR = os.environ.get('GITHUB_ACTOR')
+REPO_ACTOR = os.environ.get('GITHUB_ACTOR', 'github-actions[bot]')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 
-if not BLUESKY_HANDLE or not BLUESKY_APP_PASSWORD:
-    print("Missing BLUESKY_HANDLE or BLUESKY_APP_PASSWORD env vars.")
-    sys.exit(1)
+def main():
+    # Validate environment variables
+    if not BLUESKY_HANDLE or not BLUESKY_APP_PASSWORD:
+        print("Error: Missing BLUESKY_HANDLE or BLUESKY_APP_PASSWORD environment variables.")
+        sys.exit(1)
 
-# Load CSV
-with open(CSV_FILE, encoding='utf-8') as f:
-    reader = csv.DictReader(f)
-    posts = list(reader)
+    try:
+        # Load CSV
+        posts = load_posts()
+        if not posts:
+            print("No posts found in CSV.")
+            sys.exit(0)
+        
+        # Load state
+        state = load_state()
+        last_index = state.get('last_row_index', -1)
+        
+        # Get next post
+        next_index = (last_index + 1) % len(posts)
+        post = posts[next_index]
+        
+        # Create post content
+        content = create_post_content(post, next_index)
+        
+        # Post to Bluesky
+        post_to_bluesky(content)
+        
+        # Update state
+        update_state(next_index)
+        
+        # Commit changes back to repository
+        commit_changes(next_index)
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        sys.exit(1)
 
-if not posts:
-    print("No posts found in CSV.")
-    sys.exit(0)
+def load_posts():
+    """Load posts from CSV file."""
+    try:
+        with open(CSV_FILE, encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            return list(reader)
+    except FileNotFoundError:
+        print(f"Error: {CSV_FILE} not found.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading CSV file: {str(e)}")
+        sys.exit(1)
 
-# Load state
-if os.path.exists(STATE_FILE):
-    with open(STATE_FILE, encoding='utf-8') as f:
-        state = json.load(f)
-    last_index = state.get('last_row_index', -1)
-else:
-    last_index = -1
+def load_state():
+    """Load state from JSON file."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print(f"Warning: Invalid JSON in {STATE_FILE}. Starting from beginning.")
+            return {}
+        except Exception as e:
+            print(f"Error reading state file: {str(e)}. Starting from beginning.")
+            return {}
+    return {}
 
-# Get next post
-next_index = (last_index + 1) % len(posts)
-post = posts[next_index]
+def create_post_content(post, next_index):
+    """Create formatted post content."""
+    try:
+        title = post.get('title', '').strip()
+        url = post.get('url', '').strip()
+        hashtags = post.get('hashtags', '').strip()
+        
+        if not title or not url:
+            print(f"Error: Missing title or URL in row {next_index + 2}")
+            sys.exit(1)
+            
+        content = f"{title}\n\n{url}\n\n{hashtags}"
+        
+        # Check for length constraints
+        if len(content) > 300:
+            print(f"Warning: Post at row {next_index + 2} exceeds 300 chars. Trimming hashtags.")
+            # Try to keep as many hashtags as possible
+            max_hashtags_length = 300 - len(f"{title}\n\n{url}\n\n")
+            if max_hashtags_length > 0:
+                trimmed_hashtags = hashtags[:max_hashtags_length].strip()
+                content = f"{title}\n\n{url}\n\n{trimmed_hashtags}"
+            else:
+                content = f"{title}\n\n{url}"
+        
+        print(f"Posting row {next_index + 2}: {content}")
+        return content
+    except Exception as e:
+        print(f"Error creating post content: {str(e)}")
+        sys.exit(1)
 
-title = post['title'].strip()
-url = post['url'].strip()
-hashtags = post['hashtags'].strip()
+def get_bluesky_auth():
+    """Authenticate with Bluesky and return access token."""
+    try:
+        session = requests.Session()
+        resp = session.post('https://bsky.social/xrpc/com.atproto.server.createSession', json={
+            'identifier': BLUESKY_HANDLE,
+            'password': BLUESKY_APP_PASSWORD
+        })
+        resp.raise_for_status()
+        return resp.json()['accessJwt']
+    except requests.RequestException as e:
+        print(f"Error authenticating with Bluesky: {str(e)}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response status: {e.response.status_code}")
+            print(f"Response body: {e.response.text}")
+        sys.exit(1)
 
-content = f"{title}\n\n{url}\n\n{hashtags}"
+def post_to_bluesky(content):
+    """Post content to Bluesky."""
+    try:
+        access_jwt = get_bluesky_auth()
+        
+        headers = {
+            'Authorization': f'Bearer {access_jwt}',
+            'Content-Type': 'application/json'
+        }
+        
+        post_data = {
+            "$type": "app.bsky.feed.post",
+            "text": content,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "langs": ["en"]
+        }
+        
+        resp = requests.post(
+            'https://bsky.social/xrpc/com.atproto.repo.createRecord', 
+            headers=headers, 
+            json={
+                "collection": "app.bsky.feed.post",
+                "repo": BLUESKY_HANDLE,
+                "record": post_data
+            }
+        )
+        resp.raise_for_status()
+        print("Post successful!")
+        return True
+    except requests.RequestException as e:
+        print(f"Error posting to Bluesky: {str(e)}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response status: {e.response.status_code}")
+            print(f"Response body: {e.response.text}")
+        sys.exit(1)
 
-if len(content) > 300:
-    print(f"Warning: Post at row {next_index + 2} exceeds 300 chars. Trimming hashtags.")
-    content = f"{title}\n\n{url}\n\n"
-    # Leave hashtags out if over budget
+def update_state(next_index):
+    """Update state file with last posted index."""
+    try:
+        new_state = {
+            'last_row_index': next_index,
+            'last_post_time': datetime.now(timezone.utc).isoformat()
+        }
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(new_state, f, indent=2)
+        print(f"State updated: {new_state}")
+    except Exception as e:
+        print(f"Error updating state file: {str(e)}")
+        sys.exit(1)
 
-print(f"Posting row {next_index + 2}: {content}")
+def commit_changes(next_index):
+    """Commit state changes back to repository."""
+    try:
+        commit_message = f'Update state.json after posting row {next_index + 2}'
+        
+        # Configure Git
+        os.system(f'git config user.name "{REPO_ACTOR}"')
+        os.system(f'git config user.email "{REPO_ACTOR}@users.noreply.github.com"')
+        
+        # Add, commit and push changes
+        os.system(f'git add {STATE_FILE}')
+        os.system(f'git commit -m "{commit_message}"')
+        
+        if GITHUB_TOKEN:
+            # If token is available, use it for authentication
+            origin_url = f'https://x-access-token:{GITHUB_TOKEN}@github.com/{os.environ.get("GITHUB_REPOSITORY")}.git'
+            os.system(f'git remote set-url origin {origin_url}')
+        
+        # Push changes
+        os.system('git push')
+        print("Changes committed and pushed successfully")
+    except Exception as e:
+        print(f"Error committing changes: {str(e)}")
+        sys.exit(1)
 
-# Bluesky API: create post
-session = requests.Session()
-session.auth = (BLUESKY_HANDLE, BLUESKY_APP_PASSWORD)
-
-# Get session
-resp = session.post('https://bsky.social/xrpc/com.atproto.server.createSession', json={
-    'identifier': BLUESKY_HANDLE,
-    'password': BLUESKY_APP_PASSWORD
-})
-resp.raise_for_status()
-access_jwt = resp.json()['accessJwt']
-
-# Post the status
-headers = {
-    'Authorization': f'Bearer {access_jwt}',
-    'Content-Type': 'application/json'
-}
-post_data = {
-    "$type": "app.bsky.feed.post",
-    "text": content,
-	"createdAt": datetime.now(timezone.utc).isoformat()
-	"langs": ["en"]
-}
-resp = session.post('https://bsky.social/xrpc/com.atproto.repo.createRecord', headers=headers, json={
-    "collection": "app.bsky.feed.post",
-    "repo": BLUESKY_HANDLE,
-    "record": post_data
-})
-resp.raise_for_status()
-print("Post successful!")
-
-# Update state
-new_state = {
-    'last_row_index': next_index,
-    'last_post_time': datetime.utcnow().isoformat() + 'Z'
-}
-with open(STATE_FILE, 'w', encoding='utf-8') as f:
-    json.dump(new_state, f, indent=2)
-print(f"State updated: {new_state}")
-
-# Commit state.json back to repo
-commit_message = f'Update state.json after posting row {next_index + 2}'
-cmds = [
-    'git config user.name "{}"'.format(REPO_ACTOR),
-    'git config user.email "{}@users.noreply.github.com"'.format(REPO_ACTOR),
-    'git add {}'.format(STATE_FILE),
-    'git commit -m "{}"'.format(commit_message),
-    'git push'
-]
-for cmd in cmds:
-    print(f"Running: {cmd}")
-    os.system(cmd)
+if __name__ == "__main__":
+    main()
