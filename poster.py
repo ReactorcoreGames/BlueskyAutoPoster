@@ -73,6 +73,7 @@ post_data = {
     "$type": "app.bsky.feed.post",
     "text": content,
 	"createdAt": datetime.now(timezone.utc).isoformat()
+	"langs": ["en"]
 }
 resp = session.post('https://bsky.social/xrpc/com.atproto.repo.createRecord', headers=headers, json={
     "collection": "app.bsky.feed.post",
