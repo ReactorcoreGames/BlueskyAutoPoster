@@ -174,8 +174,16 @@ def extract_hashtag_facets(content):
         })
     return facets
 
+def extract_first_url(content):
+    """Extract the first URL from the content, or None if not found."""
+    url_pattern = re.compile(r'https?://\S+')
+    match = url_pattern.search(content)
+    if match:
+        return match.group(0)
+    return None
+
 def post_to_bluesky(content):
-    """Post content to Bluesky with rich text formatting for URLs and hashtags."""
+    """Post content to Bluesky with rich text formatting for URLs, hashtags, and link preview."""
     try:
         access_jwt = get_bluesky_auth()
         headers = {
@@ -186,18 +194,29 @@ def post_to_bluesky(content):
         # Extract facets for URLs and hashtags
         url_facets = extract_url_facets(content)
         hashtag_facets = extract_hashtag_facets(content)
-        # Avoid duplicate facets (e.g., if a hashtag is also a URL, rare but possible)
         all_facets = url_facets + hashtag_facets
 
+        # Prepare post data
         post_data = {
             "$type": "app.bsky.feed.post",
             "text": content,
             "createdAt": datetime.now(timezone.utc).isoformat(),
             "langs": ["en"]
         }
-
         if all_facets:
             post_data["facets"] = all_facets
+
+        # Add link preview (embed) for the first URL, if any
+        main_url = extract_first_url(content)
+        if main_url:
+            post_data["embed"] = {
+                "$type": "app.bsky.embed.external",
+                "external": {
+                    "uri": main_url,
+                    "title": main_url,  # Let Bluesky fill in the real preview
+                    "description": ""   # Let Bluesky fill in the real preview
+                }
+            }
 
         resp = requests.post(
             'https://bsky.social/xrpc/com.atproto.repo.createRecord',
