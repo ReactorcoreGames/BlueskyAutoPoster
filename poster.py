@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import requests
+import re
 from datetime import datetime, timezone
 
 # Constants
@@ -25,27 +26,27 @@ def main():
         if not posts:
             print("No posts found in CSV.")
             sys.exit(0)
-        
+
         # Load state
         state = load_state()
         last_index = state.get('last_row_index', -1)
-        
+
         # Get next post
         next_index = (last_index + 1) % len(posts)
         post = posts[next_index]
-        
+
         # Create post content
         content = create_post_content(post, next_index)
-        
+
         # Post to Bluesky
         post_to_bluesky(content)
-        
+
         # Update state
         update_state(next_index)
-        
+
         # Commit changes back to repository
         commit_changes(next_index)
-        
+
     except Exception as e:
         print(f"Error: {str(e)}")
         sys.exit(1)
@@ -83,13 +84,13 @@ def create_post_content(post, next_index):
         title = post.get('title', '').strip()
         url = post.get('url', '').strip()
         hashtags = post.get('hashtags', '').strip()
-        
+
         if not title or not url:
             print(f"Error: Missing title or URL in row {next_index + 2}")
             sys.exit(1)
-            
+
         content = f"{title}\n\n{url}\n\n{hashtags}"
-        
+
         # Check for length constraints
         if len(content) > 300:
             print(f"Warning: Post at row {next_index + 2} exceeds 300 chars. Trimming hashtags.")
@@ -100,9 +101,10 @@ def create_post_content(post, next_index):
                 content = f"{title}\n\n{url}\n\n{trimmed_hashtags}"
             else:
                 content = f"{title}\n\n{url}"
-        
+
         print(f"Posting row {next_index + 2}: {content}")
         return content
+
     except Exception as e:
         print(f"Error creating post content: {str(e)}")
         sys.exit(1)
@@ -124,63 +126,82 @@ def get_bluesky_auth():
             print(f"Response body: {e.response.text}")
         sys.exit(1)
 
+def extract_url_facets(content):
+    """Extract URL facets for Bluesky rich text."""
+    url_pattern = re.compile(r'https?://\S+')
+    facets = []
+    for match in url_pattern.finditer(content):
+        url = match.group(0)
+        start_idx = match.start()
+        end_idx = match.end()
+        byteStart = len(content[:start_idx].encode('utf-8'))
+        byteEnd = len(content[:end_idx].encode('utf-8'))
+        facets.append({
+            "index": {
+                "byteStart": byteStart,
+                "byteEnd": byteEnd
+            },
+            "features": [
+                {
+                    "$type": "app.bsky.richtext.facet#link",
+                    "uri": url
+                }
+            ]
+        })
+    return facets
+
+def extract_hashtag_facets(content):
+    """Extract hashtag facets for Bluesky rich text."""
+    hashtag_pattern = re.compile(r'#\w+')
+    facets = []
+    for match in hashtag_pattern.finditer(content):
+        tag = match.group(0)[1:]  # Remove the '#' symbol
+        start_idx = match.start()
+        end_idx = match.end()
+        byteStart = len(content[:start_idx].encode('utf-8'))
+        byteEnd = len(content[:end_idx].encode('utf-8'))
+        facets.append({
+            "index": {
+                "byteStart": byteStart,
+                "byteEnd": byteEnd
+            },
+            "features": [
+                {
+                    "$type": "app.bsky.richtext.facet#tag",
+                    "tag": tag
+                }
+            ]
+        })
+    return facets
+
 def post_to_bluesky(content):
-    """Post content to Bluesky with rich text formatting for URLs."""
+    """Post content to Bluesky with rich text formatting for URLs and hashtags."""
     try:
         access_jwt = get_bluesky_auth()
-        
         headers = {
             'Authorization': f'Bearer {access_jwt}',
             'Content-Type': 'application/json'
         }
-        
-        # Parse content to extract URLs for rich text formatting
-        lines = content.split('\n')
-        text = content
-        facets = []
-        
-        # Extract URLs for rich text formatting
-        import re
-        url_pattern = re.compile(r'https?://\S+')
-        
-        # Find all URLs in the content
-        for match in url_pattern.finditer(content):
-            url = match.group(0)
-            start_idx = match.start()
-            end_idx = match.end()
-            
-            # Calculate byte positions for rich text
-            byteStart = len(content[:start_idx].encode('utf-8'))
-            byteEnd = len(content[:end_idx].encode('utf-8'))
-            
-            # Create facet for URL
-            facets.append({
-                "index": {
-                    "byteStart": byteStart,
-                    "byteEnd": byteEnd
-                },
-                "features": [
-                    {
-                        "$type": "app.bsky.richtext.facet#link",
-                        "uri": url
-                    }
-                ]
-            })
-        
+
+        # Extract facets for URLs and hashtags
+        url_facets = extract_url_facets(content)
+        hashtag_facets = extract_hashtag_facets(content)
+        # Avoid duplicate facets (e.g., if a hashtag is also a URL, rare but possible)
+        all_facets = url_facets + hashtag_facets
+
         post_data = {
             "$type": "app.bsky.feed.post",
             "text": content,
             "createdAt": datetime.now(timezone.utc).isoformat(),
             "langs": ["en"]
         }
-        
-        # Add facets if we found any URLs
-        if facets:
-            post_data["facets"] = facets
-        
+
+        if all_facets:
+            post_data["facets"] = all_facets
+
         resp = requests.post(
-            'https://bsky.social/xrpc/com.atproto.repo.createRecord', 
-            headers=headers, 
+            'https://bsky.social/xrpc/com.atproto.repo.createRecord',
+            headers=headers,
             json={
                 "collection": "app.bsky.feed.post",
                 "repo": BLUESKY_HANDLE,
@@ -190,6 +211,7 @@ def post_to_bluesky(content):
         resp.raise_for_status()
         print("Post successful!")
         return True
+
     except requests.RequestException as e:
         print(f"Error posting to Bluesky: {str(e)}")
         if hasattr(e, 'response') and e.response is not None:
@@ -215,20 +237,16 @@ def commit_changes(next_index):
     """Commit state changes back to repository."""
     try:
         commit_message = f'Update state.json after posting row {next_index + 2}'
-        
         # Configure Git
         os.system(f'git config user.name "{REPO_ACTOR}"')
         os.system(f'git config user.email "{REPO_ACTOR}@users.noreply.github.com"')
-        
         # Add, commit and push changes
         os.system(f'git add {STATE_FILE}')
         os.system(f'git commit -m "{commit_message}"')
-        
         if GITHUB_TOKEN:
             # If token is available, use it for authentication
             origin_url = f'https://x-access-token:{GITHUB_TOKEN}@github.com/{os.environ.get("GITHUB_REPOSITORY")}.git'
             os.system(f'git remote set-url origin {origin_url}')
-        
         # Push changes
         os.system('git push')
         print("Changes committed and pushed successfully")
