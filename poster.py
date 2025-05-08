@@ -5,6 +5,8 @@ import sys
 import requests
 import re
 from datetime import datetime, timezone
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 # Constants
 CSV_FILE = 'posts.csv'
@@ -182,6 +184,78 @@ def extract_first_url(content):
         return match.group(0)
     return None
 
+def get_webpage_metadata(url):
+    """Fetch webpage and extract metadata for link preview."""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Initialize metadata with defaults
+        metadata = {
+            'title': soup.title.text.strip() if soup.title else url,
+            'description': '',
+            'image': None
+        }
+        
+        # Try to get OpenGraph metadata
+        og_title = soup.find('meta', property='og:title')
+        if og_title and og_title.get('content'):
+            metadata['title'] = og_title['content']
+        
+        og_description = soup.find('meta', property='og:description')
+        if og_description and og_description.get('content'):
+            metadata['description'] = og_description['content']
+        
+        # Try different image meta tags
+        image_url = None
+        
+        # 1. OpenGraph image
+        og_image = soup.find('meta', property='og:image')
+        if og_image and og_image.get('content'):
+            image_url = og_image['content']
+        
+        # 2. Twitter image
+        if not image_url:
+            twitter_image = soup.find('meta', property='twitter:image')
+            if twitter_image and twitter_image.get('content'):
+                image_url = twitter_image['content']
+        
+        # 3. Regular image meta
+        if not image_url:
+            image_meta = soup.find('meta', attrs={'name': 'image'})
+            if image_meta and image_meta.get('content'):
+                image_url = image_meta['content']
+        
+        # 4. Look for the first large image
+        if not image_url:
+            for img in soup.find_all('img', src=True):
+                # Skip small images, icons, etc.
+                if img.get('width') and int(img['width']) < 100:
+                    continue
+                if img.get('height') and int(img['height']) < 100:
+                    continue
+                image_url = img['src']
+                break
+        
+        # Make sure image URL is absolute
+        if image_url:
+            metadata['image'] = urljoin(url, image_url)
+        
+        return metadata
+        
+    except Exception as e:
+        print(f"Warning: Error fetching metadata for {url}: {str(e)}")
+        return {
+            'title': url,
+            'description': '',
+            'image': None
+        }
+
 def post_to_bluesky(content):
     """Post content to Bluesky with rich text formatting for URLs, hashtags, and link preview."""
     try:
@@ -209,13 +283,26 @@ def post_to_bluesky(content):
         # Add link preview (embed) for the first URL, if any
         main_url = extract_first_url(content)
         if main_url:
+            # Get metadata including image from the URL
+            print(f"Fetching metadata for {main_url}")
+            metadata = get_webpage_metadata(main_url)
+            
+            external_embed = {
+                "uri": main_url,
+                "title": metadata['title'],
+                "description": metadata['description']
+            }
+            
+            # Add thumb if image was found
+            if metadata['image']:
+                external_embed["thumb"] = metadata['image']
+                print(f"Found image for preview: {metadata['image']}")
+            else:
+                print("No image found for preview")
+                
             post_data["embed"] = {
                 "$type": "app.bsky.embed.external",
-                "external": {
-                    "uri": main_url,
-                    "title": main_url,  # Let Bluesky fill in the real preview
-                    "description": ""   # Let Bluesky fill in the real preview
-                }
+                "external": external_embed
             }
 
         resp = requests.post(
