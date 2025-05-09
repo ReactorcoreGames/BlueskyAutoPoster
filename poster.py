@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from io import BytesIO
 
 # Constants
 CSV_FILE = 'posts.csv'
@@ -120,7 +121,8 @@ def get_bluesky_auth():
             'password': BLUESKY_APP_PASSWORD
         })
         resp.raise_for_status()
-        return resp.json()['accessJwt']
+        auth_data = resp.json()
+        return auth_data['accessJwt'], auth_data['did']
     except requests.RequestException as e:
         print(f"Error authenticating with Bluesky: {str(e)}")
         if hasattr(e, 'response') and e.response is not None:
@@ -199,7 +201,8 @@ def get_webpage_metadata(url):
         metadata = {
             'title': soup.title.text.strip() if soup.title else url,
             'description': '',
-            'image': None
+            'image': None,
+            'image_alt': ''
         }
         
         # Try to get OpenGraph metadata
@@ -218,12 +221,22 @@ def get_webpage_metadata(url):
         og_image = soup.find('meta', property='og:image')
         if og_image and og_image.get('content'):
             image_url = og_image['content']
+            
+            # Try to get image alt text
+            og_image_alt = soup.find('meta', property='og:image:alt')
+            if og_image_alt and og_image_alt.get('content'):
+                metadata['image_alt'] = og_image_alt['content']
         
         # 2. Twitter image
         if not image_url:
             twitter_image = soup.find('meta', property='twitter:image')
             if twitter_image and twitter_image.get('content'):
                 image_url = twitter_image['content']
+                
+                # Try to get image alt text
+                twitter_image_alt = soup.find('meta', property='twitter:image:alt')
+                if twitter_image_alt and twitter_image_alt.get('content'):
+                    metadata['image_alt'] = twitter_image_alt['content']
         
         # 3. Regular image meta
         if not image_url:
@@ -240,6 +253,11 @@ def get_webpage_metadata(url):
                 if img.get('height') and int(img['height']) < 100:
                     continue
                 image_url = img['src']
+                
+                # Get alt text if available
+                if img.get('alt'):
+                    metadata['image_alt'] = img['alt']
+                    
                 break
         
         # Make sure image URL is absolute
@@ -253,13 +271,49 @@ def get_webpage_metadata(url):
         return {
             'title': url,
             'description': '',
-            'image': None
+            'image': None,
+            'image_alt': ''
         }
+
+def upload_image_blob(image_url, access_jwt):
+    """Upload an image to Bluesky's XRPC service and return the blob reference."""
+    try:
+        print(f"Downloading image from: {image_url}")
+        response = requests.get(image_url, timeout=10)
+        response.raise_for_status()
+        
+        image_data = response.content
+        content_type = response.headers.get('Content-Type', 'image/jpeg')
+        
+        print(f"Uploading image as blob (size: {len(image_data)} bytes, type: {content_type})")
+        
+        headers = {
+            'Authorization': f'Bearer {access_jwt}',
+            'Content-Type': content_type
+        }
+        
+        upload_response = requests.post(
+            'https://bsky.social/xrpc/com.atproto.repo.uploadBlob',
+            headers=headers,
+            data=image_data
+        )
+        upload_response.raise_for_status()
+        
+        blob_data = upload_response.json().get('blob')
+        print(f"Image uploaded successfully as blob: {blob_data}")
+        
+        return blob_data
+    except Exception as e:
+        print(f"Error uploading image: {str(e)}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response status: {e.response.status_code}")
+            print(f"Response body: {e.response.text}")
+        return None
 
 def post_to_bluesky(content):
     """Post content to Bluesky with rich text formatting for URLs, hashtags, and link preview."""
     try:
-        access_jwt = get_bluesky_auth()
+        access_jwt, did = get_bluesky_auth()
         headers = {
             'Authorization': f'Bearer {access_jwt}',
             'Content-Type': 'application/json'
@@ -293,10 +347,14 @@ def post_to_bluesky(content):
                 "description": metadata['description']
             }
             
-            # Add thumb if image was found
+            # Add thumb if image was found - need to upload as blob first
             if metadata['image']:
-                external_embed["thumb"] = metadata['image']
                 print(f"Found image for preview: {metadata['image']}")
+                blob = upload_image_blob(metadata['image'], access_jwt)
+                if blob:
+                    external_embed["thumb"] = blob
+                    if metadata['image_alt']:
+                        external_embed["alt"] = metadata['image_alt']
             else:
                 print("No image found for preview")
                 
@@ -310,7 +368,7 @@ def post_to_bluesky(content):
             headers=headers,
             json={
                 "collection": "app.bsky.feed.post",
-                "repo": BLUESKY_HANDLE,
+                "repo": did,
                 "record": post_data
             }
         )
