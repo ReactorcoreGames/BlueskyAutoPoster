@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from io import BytesIO
+from PIL import Image
 
 # Constants
 CSV_FILE = 'posts.csv'
@@ -16,6 +17,9 @@ BLUESKY_HANDLE = os.environ.get('BLUESKY_HANDLE')
 BLUESKY_APP_PASSWORD = os.environ.get('BLUESKY_APP_PASSWORD')
 REPO_ACTOR = os.environ.get('GITHUB_ACTOR', 'github-actions[bot]')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+
+# Bluesky image size limit (in bytes) - leave some buffer
+MAX_IMAGE_SIZE = 950 * 1024  # 950KB to be safe
 
 def main():
     # Validate environment variables
@@ -275,6 +279,84 @@ def get_webpage_metadata(url):
             'image_alt': ''
         }
 
+def resize_image_if_needed(image_data, max_size=MAX_IMAGE_SIZE, quality=85):
+    """Resize image if it exceeds the maximum size limit."""
+    try:
+        original_size = len(image_data)
+        print(f"Original image size: {original_size} bytes")
+        
+        if original_size <= max_size:
+            print("Image is within size limit, no resizing needed")
+            return image_data
+        
+        print(f"Image exceeds {max_size} bytes, resizing...")
+        
+        # Open image with PIL
+        img = Image.open(BytesIO(image_data))
+        original_format = img.format
+        
+        # Convert to RGB if necessary (for JPEG output)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create a white background for transparent images
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Try different strategies to reduce file size
+        strategies = [
+            # Strategy 1: Reduce quality
+            {'resize_factor': 1.0, 'quality': 70},
+            {'resize_factor': 1.0, 'quality': 60},
+            {'resize_factor': 1.0, 'quality': 50},
+            
+            # Strategy 2: Resize image while maintaining quality
+            {'resize_factor': 0.9, 'quality': 85},
+            {'resize_factor': 0.8, 'quality': 85},
+            {'resize_factor': 0.7, 'quality': 80},
+            {'resize_factor': 0.6, 'quality': 80},
+            {'resize_factor': 0.5, 'quality': 75},
+            
+            # Strategy 3: Aggressive resizing with lower quality
+            {'resize_factor': 0.4, 'quality': 70},
+            {'resize_factor': 0.3, 'quality': 65},
+        ]
+        
+        for strategy in strategies:
+            # Create a copy of the image for this attempt
+            temp_img = img.copy()
+            
+            # Resize if needed
+            if strategy['resize_factor'] < 1.0:
+                new_width = int(temp_img.width * strategy['resize_factor'])
+                new_height = int(temp_img.height * strategy['resize_factor'])
+                temp_img = temp_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                print(f"Resized to {new_width}x{new_height} (factor: {strategy['resize_factor']})")
+            
+            # Save with specified quality
+            output = BytesIO()
+            temp_img.save(output, format='JPEG', quality=strategy['quality'], optimize=True)
+            result_data = output.getvalue()
+            result_size = len(result_data)
+            
+            print(f"Attempt with quality {strategy['quality']}, resize {strategy['resize_factor']}: {result_size} bytes")
+            
+            if result_size <= max_size:
+                print(f"Successfully reduced image size from {original_size} to {result_size} bytes")
+                return result_data
+        
+        # If all strategies failed, return the last attempt (smallest size)
+        print(f"Warning: Could not reduce image below {max_size} bytes. Using smallest version ({result_size} bytes)")
+        return result_data
+        
+    except Exception as e:
+        print(f"Error resizing image: {str(e)}")
+        # Return original data if resizing fails
+        return image_data
+
 def upload_image_blob(image_url, access_jwt):
     """Upload an image to Bluesky's XRPC service and return the blob reference."""
     try:
@@ -282,10 +364,18 @@ def upload_image_blob(image_url, access_jwt):
         response = requests.get(image_url, timeout=10)
         response.raise_for_status()
         
-        image_data = response.content
-        content_type = response.headers.get('Content-Type', 'image/jpeg')
+        original_image_data = response.content
+        original_content_type = response.headers.get('Content-Type', 'image/jpeg')
         
-        print(f"Uploading image as blob (size: {len(image_data)} bytes, type: {content_type})")
+        print(f"Downloaded image (size: {len(original_image_data)} bytes, type: {original_content_type})")
+        
+        # Resize image if it's too large
+        processed_image_data = resize_image_if_needed(original_image_data)
+        
+        # Always use JPEG for processed images to ensure compatibility
+        content_type = 'image/jpeg'
+        
+        print(f"Uploading image as blob (final size: {len(processed_image_data)} bytes, type: {content_type})")
         
         headers = {
             'Authorization': f'Bearer {access_jwt}',
@@ -295,7 +385,7 @@ def upload_image_blob(image_url, access_jwt):
         upload_response = requests.post(
             'https://bsky.social/xrpc/com.atproto.repo.uploadBlob',
             headers=headers,
-            data=image_data
+            data=processed_image_data
         )
         upload_response.raise_for_status()
         

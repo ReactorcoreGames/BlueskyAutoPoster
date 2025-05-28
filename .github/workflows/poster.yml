@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: '3.x'
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install requests beautifulsoup4 pillow
       - name: Run poster script
         env:
           BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
